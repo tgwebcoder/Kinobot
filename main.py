@@ -1,22 +1,11 @@
-"""
-🎬 KINO BOT — Aiogram 3.x + PostgreSQL (Railway)
-================================================
-Mualllif tarkibi:
-  - Majburiy obuna middleware
-  - Kino qo'shish va nusxalash (copy_message)
-  - Admin panel (statistika, reklama, kanallar, adminlar)
-  - O'zbek tilli professional interfeys
-"""
-
 import asyncio
 import logging
 import os
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import List, Optional
 
-from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.filters import CommandStart
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -25,953 +14,675 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    Update,
 )
-from sqlalchemy import BigInteger, DateTime, Integer, String, func, select, update
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    DateTime,
+    Integer,
+    String,
+    Text,
+    select,
+    func,
+    update as sa_update,
+)
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase
 
-# ═══════════════════════════════════════════════════════════
-#  ⚙️  CONFIG — Muhit o'zgaruvchilari
-# ═══════════════════════════════════════════════════════════
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-DATABASE_URL = os.environ.get("DATABASE_URL")
-SUPER_ADMIN_ID = int(os.environ.get("SUPER_ADMIN_ID", "0"))
+# ─────────────────────────────────────────────
+# ⚙️  SOZLAMALAR
+# ─────────────────────────────────────────────
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost/dbname")
 
-# Railway asyncpg uchun URL ni to'g'irlash
+# Railway postgres:// → postgresql+asyncpg:// conversion
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
-elif DATABASE_URL.startswith("postgresql://"):
+elif DATABASE_URL.startswith("postgresql://") and "asyncpg" not in DATABASE_URL:
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
 
-# ═══════════════════════════════════════════════════════════
-#  🗄️  DATABASE MODELLARI
-# ═══════════════════════════════════════════════════════════
+# Super adminlar (Telegram ID lar)
+SUPER_ADMINS: List[int] = [int(x) for x in os.getenv("SUPER_ADMINS", "123456789").split(",") if x.strip()]
+
+# Majburiy obuna kanallari (boshlang'ich)
+DEFAULT_CHANNELS: List[str] = [ch for ch in os.getenv("CHANNELS", "@mychannel").split(",") if ch.strip()]
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────
+# 🗄️  DATABASE MODELLARI
+# ─────────────────────────────────────────────
 class Base(DeclarativeBase):
     pass
 
 
-class User(Base):
+class UserModel(Base):
     __tablename__ = "users"
+    id = Column(BigInteger, primary_key=True)          # Telegram user_id
+    username = Column(String(64), nullable=True)
+    full_name = Column(String(128), nullable=True)
+    joined_at = Column(DateTime, default=datetime.utcnow)
+    last_seen = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
-    username: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    full_name: Mapped[str] = mapped_column(String(200), nullable=False)
-    joined_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
-
-class Movie(Base):
+class MovieModel(Base):
     __tablename__ = "movies"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    code: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
-    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    message_id: Mapped[int] = mapped_column(Integer, nullable=False)
-    views: Mapped[int] = mapped_column(Integer, default=0)
-    added_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-
-class Channel(Base):
-    __tablename__ = "channels"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    channel_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
-    channel_username: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    channel_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(32), unique=True, nullable=False)   # Foydalanuvchi yuboriladigan kod
+    chat_id = Column(BigInteger, nullable=False)              # Xabar joylashgan chat
+    message_id = Column(BigInteger, nullable=False)           # Asl xabar ID
+    title = Column(String(256), nullable=True)                # Ixtiyoriy nom
+    views = Column(Integer, default=0)
+    added_at = Column(DateTime, default=datetime.utcnow)
 
 
-class Admin(Base):
+class AdminModel(Base):
     __tablename__ = "admins"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
-    added_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    id = Column(BigInteger, primary_key=True)   # Telegram user_id
+    added_at = Column(DateTime, default=datetime.utcnow)
 
 
-# Async engine va session factory
-engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
-async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+class ChannelModel(Base):
+    __tablename__ = "channels"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String(64), unique=True, nullable=False)   # @channelusername
 
 
-async def init_db() -> None:
-    """Jadvallarni yaratish va super adminni ro'yxatdan o'tkazish."""
+# ─────────────────────────────────────────────
+# 🔌  DB ENGINE
+# ─────────────────────────────────────────────
+engine = create_async_engine(DATABASE_URL, echo=False)
+AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+
+async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    # Default kanallarni qo'shish
+    async with AsyncSessionLocal() as s:
+        for ch in DEFAULT_CHANNELS:
+            ch = ch.strip()
+            if not ch:
+                continue
+            existing = await s.get(ChannelModel, None)
+            res = await s.execute(select(ChannelModel).where(ChannelModel.username == ch))
+            if not res.scalar_one_or_none():
+                s.add(ChannelModel(username=ch))
+        await s.commit()
 
-    if SUPER_ADMIN_ID:
-        async with async_session() as session:
-            exists = await session.scalar(
-                select(Admin).where(Admin.user_id == SUPER_ADMIN_ID)
-            )
-            if not exists:
-                session.add(Admin(user_id=SUPER_ADMIN_ID))
-                await session.commit()
+
+# ─────────────────────────────────────────────
+# 🛠️  YORDAMCHI FUNKSIYALAR
+# ─────────────────────────────────────────────
+async def get_channels(session: AsyncSession) -> List[str]:
+    res = await session.execute(select(ChannelModel))
+    return [r.username for r in res.scalars().all()]
 
 
-# ═══════════════════════════════════════════════════════════
-#  🎛️  FSM HOLATLARI
-# ═══════════════════════════════════════════════════════════
-class AddMovieStates(StatesGroup):
+async def is_admin(session: AsyncSession, user_id: int) -> bool:
+    if user_id in SUPER_ADMINS:
+        return True
+    adm = await session.get(AdminModel, user_id)
+    return adm is not None
+
+
+async def check_subscription(bot: Bot, user_id: int, channels: List[str]) -> List[str]:
+    """Obuna bo'lmagan kanallar ro'yxatini qaytaradi."""
+    not_subscribed = []
+    for ch in channels:
+        try:
+            member = await bot.get_chat_member(ch, user_id)
+            if member.status in ("left", "kicked", "restricted"):
+                not_subscribed.append(ch)
+        except Exception:
+            not_subscribed.append(ch)
+    return not_subscribed
+
+
+async def register_user(session: AsyncSession, message: Message):
+    user = message.from_user
+    existing = await session.get(UserModel, user.id)
+    if existing:
+        existing.last_seen = datetime.utcnow()
+        existing.username = user.username
+        existing.full_name = user.full_name
+    else:
+        session.add(UserModel(
+            id=user.id,
+            username=user.username,
+            full_name=user.full_name,
+        ))
+    await session.commit()
+
+
+def sub_keyboard(channels: List[str]) -> InlineKeyboardMarkup:
+    buttons = []
+    for ch in channels:
+        link = f"https://t.me/{ch.lstrip('@')}"
+        buttons.append([InlineKeyboardButton(text=f"📢 {ch}", url=link)])
+    buttons.append([InlineKeyboardButton(text="✅ Tekshirish", callback_data="check_sub")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+# ─────────────────────────────────────────────
+# 📋  STATES
+# ─────────────────────────────────────────────
+class AddMovie(StatesGroup):
     waiting_code = State()
     waiting_video = State()
 
 
-class BroadcastStates(StatesGroup):
-    choosing_type = State()
+class Broadcast(StatesGroup):
     waiting_content = State()
 
 
-class AddChannelStates(StatesGroup):
-    waiting_channel = State()
-
-
-class RemoveChannelStates(StatesGroup):
+class AddAdmin(StatesGroup):
     waiting_id = State()
 
 
-class AddAdminStates(StatesGroup):
-    waiting_user_id = State()
+class AddChannel(StatesGroup):
+    waiting_username = State()
 
 
-class SearchMovieStates(StatesGroup):
-    waiting_code = State()
+# ─────────────────────────────────────────────
+# ⌨️  KLAVIATURALAR
+# ─────────────────────────────────────────────
+def main_admin_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🎬 Kino qo'shish", callback_data="admin_add_movie"),
+            InlineKeyboardButton(text="📊 Statistika", callback_data="admin_stats"),
+        ],
+        [
+            InlineKeyboardButton(text="📣 Reklama", callback_data="admin_broadcast"),
+            InlineKeyboardButton(text="📢 Kanallar", callback_data="admin_channels"),
+        ],
+        [
+            InlineKeyboardButton(text="👑 Adminlar", callback_data="admin_admins"),
+        ],
+    ])
 
 
-# ═══════════════════════════════════════════════════════════
-#  🎹  KLAVIATURALAR
-# ═══════════════════════════════════════════════════════════
-def main_menu_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text="🎬 Kino qidirish", callback_data="search_movie")],
-        [InlineKeyboardButton(text="ℹ️ Bot haqida", callback_data="about_bot")],
-    ]
-    if is_admin:
-        rows.append(
-            [InlineKeyboardButton(text="⚙️ Admin Panel", callback_data="admin_panel")]
-        )
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def admin_panel_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🎬 Kino qo'shish", callback_data="add_movie")],
-            [InlineKeyboardButton(text="📊 Statistika", callback_data="stats")],
-            [InlineKeyboardButton(text="📢 Reklama", callback_data="broadcast")],
-            [InlineKeyboardButton(text="📡 Kanallar", callback_data="manage_channels")],
-            [InlineKeyboardButton(text="👑 Admin qo'shish", callback_data="add_admin")],
-            [InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="main_menu")],
-        ]
-    )
-
-
-def channels_panel_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Kanal qo'shish", callback_data="add_channel")],
-            [InlineKeyboardButton(text="🗑 Kanal o'chirish", callback_data="remove_channel")],
-            [InlineKeyboardButton(text="📋 Ro'yxatni ko'rish", callback_data="list_channels")],
-            [InlineKeyboardButton(text="🔙 Admin panel", callback_data="admin_panel")],
-        ]
-    )
-
-
-def broadcast_type_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📝 Matn", callback_data="bc_text"),
-                InlineKeyboardButton(text="🖼 Rasm", callback_data="bc_photo"),
-            ],
-            [InlineKeyboardButton(text="📨 Forward", callback_data="bc_forward")],
-            [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel")],
-        ]
-    )
+def back_kb(data: str = "admin_panel") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Orqaga", callback_data=data)]
+    ])
 
 
 def cancel_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel")]
-        ]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel_action")]
+    ])
 
 
-def back_admin_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 Admin panel", callback_data="admin_panel")]
-        ]
-    )
-
-
-def subscribe_kb(channels: list) -> InlineKeyboardMarkup:
-    rows = []
-    for ch in channels:
-        username = ch.channel_username
-        if username:
-            url = f"https://t.me/{username.lstrip('@')}"
-            rows.append(
-                [InlineKeyboardButton(text=f"📢 {ch.channel_name}", url=url)]
-            )
-    rows.append(
-        [InlineKeyboardButton(text="✅ Obuna bo'ldim!", callback_data="check_sub")]
-    )
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-# ═══════════════════════════════════════════════════════════
-#  🛠️  YORDAMCHI FUNKSIYALAR
-# ═══════════════════════════════════════════════════════════
-async def check_is_admin(user_id: int) -> bool:
-    async with async_session() as session:
-        result = await session.scalar(
-            select(Admin).where(Admin.user_id == user_id)
-        )
-        return result is not None
-
-
-async def get_all_channels() -> list:
-    async with async_session() as session:
-        rows = await session.scalars(select(Channel))
-        return list(rows.all())
-
-
-async def check_subscription(bot: Bot, user_id: int) -> list:
-    """Foydalanuvchi obuna bo'lmagan kanallarni qaytaradi."""
-    channels = await get_all_channels()
-    not_subbed = []
-    for ch in channels:
-        try:
-            member = await bot.get_chat_member(ch.channel_id, user_id)
-            if member.status in ("left", "kicked", "banned"):
-                not_subbed.append(ch)
-        except Exception:
-            not_subbed.append(ch)
-    return not_subbed
-
-
-async def register_user(user_id: int, username: Optional[str], full_name: str) -> None:
-    async with async_session() as session:
-        exists = await session.scalar(
-            select(User).where(User.user_id == user_id)
-        )
-        if not exists:
-            session.add(
-                User(user_id=user_id, username=username, full_name=full_name)
-            )
-            await session.commit()
-
-
-# ═══════════════════════════════════════════════════════════
-#  🔒  MAJBURIY OBUNA MIDDLEWARE
-# ═══════════════════════════════════════════════════════════
-ALLOWED_CALLBACKS = {"check_sub"}
-ALLOWED_COMMANDS = {"/start"}
-
-
-class SubscriptionMiddleware(BaseMiddleware):
-    async def __call__(
-        self,
-        handler: Callable[[Any, Dict[str, Any]], Awaitable[Any]],
-        event: Any,
-        data: Dict[str, Any],
-    ) -> Any:
-        bot: Bot = data["bot"]
-
-        # Foydalanuvchi ID ni aniqlash
-        if isinstance(event, Message):
-            user = event.from_user
-            # /start har doim o'tadi
-            if event.text and event.text.split()[0] in ALLOWED_COMMANDS:
-                return await handler(event, data)
-        elif isinstance(event, CallbackQuery):
-            user = event.from_user
-            # Obuna tekshirish tugmasi o'tadi
-            if event.data in ALLOWED_CALLBACKS:
-                return await handler(event, data)
-        else:
-            return await handler(event, data)
-
-        if user is None:
-            return await handler(event, data)
-
-        # Adminlar tekshirilmaydi
-        if await check_is_admin(user.id):
-            return await handler(event, data)
-
-        # Obunani tekshirish
-        not_subbed = await check_subscription(bot, user.id)
-        if not_subbed:
-            sub_text = (
-                "🔐 <b>Botdan foydalanish uchun quyidagi\n"
-                "kanallarga obuna bo'lishingiz shart!</b>\n\n"
-                "📌 Barcha kanallarga obuna bo'lgach,\n"
-                "<b>✅ Obuna bo'ldim!</b> tugmasini bosing."
-            )
-            if isinstance(event, Message):
-                await event.answer(
-                    sub_text,
-                    reply_markup=subscribe_kb(not_subbed),
-                    parse_mode="HTML",
-                )
-            elif isinstance(event, CallbackQuery):
-                await event.message.answer(
-                    sub_text,
-                    reply_markup=subscribe_kb(not_subbed),
-                    parse_mode="HTML",
-                )
-                await event.answer()
-            return  # Handlergacha bormaslik
-
-        return await handler(event, data)
-
-
-# ═══════════════════════════════════════════════════════════
-#  🗺️  ROUTER
-# ═══════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────
+# 🤖  ROUTER VA HANDLERLAR
+# ─────────────────────────────────────────────
 router = Router()
 
 
-# ═══════════════════════════════════════════════════════════
-#  👤  FOYDALANUVCHI HANDLERLARI
-# ═══════════════════════════════════════════════════════════
+# ── /start ──
 @router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    user = message.from_user
-    await register_user(user.id, user.username, user.full_name)
+async def cmd_start(message: Message, bot: Bot):
+    async with AsyncSessionLocal() as s:
+        await register_user(s, message)
+        channels = await get_channels(s)
+        not_sub = await check_subscription(bot, message.from_user.id, channels)
 
-    admin = await check_is_admin(user.id)
-    not_subbed = await check_subscription(message.bot, user.id)
-
-    if not_subbed and not admin:
+    if not_sub:
         await message.answer(
-            "🔐 <b>Botdan foydalanish uchun quyidagi\n"
-            "kanallarga obuna bo'lishingiz shart!</b>\n\n"
-            "📌 Barcha kanallarga obuna bo'lgach,\n"
-            "<b>✅ Obuna bo'ldim!</b> tugmasini bosing.",
-            reply_markup=subscribe_kb(not_subbed),
+            "🎬 <b>Kino Botga Xush Kelibsiz!</b>\n\n"
+            "🔐 Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling:\n\n"
+            "⬇️ <i>Obuna bo'lgach «✅ Tekshirish» tugmasini bosing!</i>",
+            reply_markup=sub_keyboard(not_sub),
             parse_mode="HTML",
         )
         return
 
     await message.answer(
-        f"🎬 <b>Xush kelibsiz, {user.first_name}!</b>\n\n"
-        "🍿 Men — <b>Kino Bot</b>!\n"
-        "📥 Sevimli kinolaringizni kod orqali topishingiz mumkin.\n\n"
-        "🔢 Kino kodini yuboring va tomosha qiling! 🚀",
-        reply_markup=main_menu_kb(is_admin=admin),
+        f"🎉 <b>Salom, {message.from_user.first_name}!</b>\n\n"
+        "🎬 <b>Kino Botga Xush Kelibsiz!</b>\n\n"
+        "📽️ Kino kodini yuboring va fil'mingizni tomosha qiling!\n\n"
+        "💡 <i>Masalan: </i><code>001</code>",
         parse_mode="HTML",
     )
 
 
+# ── Obuna tekshirish callback ──
 @router.callback_query(F.data == "check_sub")
-async def check_sub_callback(callback: CallbackQuery, state: FSMContext) -> None:
-    user = callback.from_user
-    not_subbed = await check_subscription(callback.bot, user.id)
+async def check_sub_callback(call: CallbackQuery, bot: Bot):
+    async with AsyncSessionLocal() as s:
+        channels = await get_channels(s)
+        not_sub = await check_subscription(bot, call.from_user.id, channels)
 
-    if not_subbed:
-        await callback.answer(
-            "❌ Siz hali barcha kanallarga obuna bo'lmagansiz!",
-            show_alert=True,
-        )
+    if not_sub:
+        await call.answer("❌ Hali obuna bo'lmagan kanallar bor!", show_alert=True)
+        await call.message.edit_reply_markup(reply_markup=sub_keyboard(not_sub))
         return
 
-    await callback.message.delete()
-    await register_user(user.id, user.username, user.full_name)
-    admin = await check_is_admin(user.id)
-
-    await callback.message.answer(
-        f"✅ <b>Tabriklaymiz, {user.first_name}!</b>\n\n"
-        "🎉 Barcha kanallarga obuna bo'ldingiz!\n"
-        "🎬 Endi botdan to'liq foydalaning.\n\n"
-        "🔢 Kino kodini yuboring va rohat qiling! 🍿",
-        reply_markup=main_menu_kb(is_admin=admin),
+    await call.message.edit_text(
+        f"✅ <b>Zo'r, {call.from_user.first_name}!</b>\n\n"
+        "🎬 Endi kino kodini yuboring va tomosha qiling!\n\n"
+        "💡 <i>Masalan: </i><code>001</code>",
         parse_mode="HTML",
     )
 
 
-@router.callback_query(F.data == "main_menu")
-async def cb_main_menu(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    admin = await check_is_admin(callback.from_user.id)
-    await callback.message.edit_text(
-        "🏠 <b>Bosh Menyu</b>\n\n"
-        "🎬 Kino kodini yuboring yoki tugmalardan foydalaning!",
-        reply_markup=main_menu_kb(is_admin=admin),
+# ── /admin ──
+@router.message(Command("admin"))
+async def cmd_admin(message: Message):
+    async with AsyncSessionLocal() as s:
+        if not await is_admin(s, message.from_user.id):
+            await message.answer("🚫 <b>Sizda admin huquqi yo'q!</b>", parse_mode="HTML")
+            return
+
+    await message.answer(
+        "👑 <b>Admin Panel</b>\n\n"
+        "🛠️ Quyidagi amallardan birini tanlang:",
+        reply_markup=main_admin_kb(),
         parse_mode="HTML",
     )
 
 
-@router.callback_query(F.data == "about_bot")
-async def cb_about(callback: CallbackQuery) -> None:
-    async with async_session() as session:
-        user_count = await session.scalar(select(func.count(User.id))) or 0
-        movie_count = await session.scalar(select(func.count(Movie.id))) or 0
-
-    await callback.message.edit_text(
-        "🎬 <b>Kino Bot haqida</b>\n\n"
-        f"👥 Foydalanuvchilar: <b>{user_count:,}</b> ta\n"
-        f"🎥 Kinolar bazasi: <b>{movie_count:,}</b> ta\n\n"
-        "🔢 Kino kodini yuboring — darhol tomosha qiling!\n"
-        "💡 Botni do'stlaringizga ulashing! 🚀",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🔙 Orqaga", callback_data="main_menu")]
-            ]
-        ),
-        parse_mode="HTML",
-    )
-
-
-@router.callback_query(F.data == "search_movie")
-async def cb_search_movie(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(SearchMovieStates.waiting_code)
-    await callback.message.edit_text(
-        "🔍 <b>Kino qidirish</b>\n\n"
-        "🔢 Kino kodini yuboring:\n"
-        "💡 Masalan: <code>1234</code> yoki <code>KN001</code>",
-        reply_markup=cancel_kb(),
-        parse_mode="HTML",
-    )
-
-
-@router.message(SearchMovieStates.waiting_code)
-async def handle_code_state(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await _send_movie(message, message.text.strip())
-
-
-@router.message(F.text & ~F.text.startswith("/"))
-async def handle_text(message: Message, state: FSMContext) -> None:
-    current = await state.get_state()
-    if current:
-        return  # Holatga tegishli handler qabul qiladi
-    await _send_movie(message, message.text.strip())
-
-
-async def _send_movie(message: Message, code: str) -> None:
-    """Kino kodiga qarab videoni nusxalab yuborish."""
-    async with async_session() as session:
-        movie = await session.scalar(select(Movie).where(Movie.code == code))
-
-    if not movie:
-        await message.answer(
-            f"❌ <b>«{code}» kodi bo'yicha kino topilmadi!</b>\n\n"
-            "🔢 Kodni to'g'ri kiritdingizmi?\n"
-            "💬 Muammo bo'lsa, admin bilan bog'laning.",
-            parse_mode="HTML",
-        )
-        return
-
-    try:
-        await message.bot.copy_message(
-            chat_id=message.chat.id,
-            from_chat_id=movie.chat_id,
-            message_id=movie.message_id,
-            caption=None,  # Hech qanday matn yoki reklama chiqmasin
-        )
-        # Ko'rishlar sonini oshirish
-        async with async_session() as session:
-            await session.execute(
-                update(Movie)
-                .where(Movie.code == code)
-                .values(views=Movie.views + 1)
-            )
-            await session.commit()
-
-    except TelegramBadRequest as e:
-        logging.error(f"copy_message xatosi [{code}]: {e}")
-        await message.answer(
-            "⚠️ <b>Kino yuborishda texnik xatolik!</b>\n\n"
-            "🔧 Iltimos, keyinroq qayta urinib ko'ring.",
-            parse_mode="HTML",
-        )
-
-
-# ═══════════════════════════════════════════════════════════
-#  ⚙️  ADMIN PANEL HANDLERLARI
-# ═══════════════════════════════════════════════════════════
-async def _require_admin(callback: CallbackQuery) -> bool:
-    if not await check_is_admin(callback.from_user.id):
-        await callback.answer("⛔ Sizda bu amal uchun ruxsat yo'q!", show_alert=True)
-        return False
-    return True
-
-
+# ── Admin panel callback ──
 @router.callback_query(F.data == "admin_panel")
-async def cb_admin_panel(callback: CallbackQuery, state: FSMContext) -> None:
-    if not await _require_admin(callback):
-        return
-    await state.clear()
-    await callback.message.edit_text(
-        "⚙️ <b>Admin Panel</b>\n\n"
-        "🎛 Quyidagi amallardan birini tanlang:",
-        reply_markup=admin_panel_kb(),
+async def admin_panel_cb(call: CallbackQuery):
+    async with AsyncSessionLocal() as s:
+        if not await is_admin(s, call.from_user.id):
+            await call.answer("🚫 Ruxsat yo'q!", show_alert=True)
+            return
+
+    await call.message.edit_text(
+        "👑 <b>Admin Panel</b>\n\n"
+        "🛠️ Quyidagi amallardan birini tanlang:",
+        reply_markup=main_admin_kb(),
         parse_mode="HTML",
     )
 
 
-# ───────────────────────────────────────────────────────────
-#  🎬 KINO QO'SHISH
-# ───────────────────────────────────────────────────────────
-@router.callback_query(F.data == "add_movie")
-async def cb_add_movie(callback: CallbackQuery, state: FSMContext) -> None:
-    if not await _require_admin(callback):
-        return
-    await state.set_state(AddMovieStates.waiting_code)
-    await callback.message.edit_text(
+# ── Kino qo'shish ──
+@router.callback_query(F.data == "admin_add_movie")
+async def add_movie_start(call: CallbackQuery, state: FSMContext):
+    async with AsyncSessionLocal() as s:
+        if not await is_admin(s, call.from_user.id):
+            await call.answer("🚫 Ruxsat yo'q!", show_alert=True)
+            return
+
+    await call.message.edit_text(
         "🎬 <b>Yangi Kino Qo'shish</b>\n\n"
-        "1️⃣ Avval kino <b>kodini</b> yuboring:\n\n"
-        "💡 Masalan: <code>1234</code> yoki <code>KN001</code>\n"
-        "⚠️ Kod noyob bo'lishi kerak!",
+        "1️⃣ Avval kinoning <b>kodini</b> yuboring:\n\n"
+        "💡 <i>Masalan: </i><code>001</code> <i>yoki</i> <code>avatar2</code>",
         reply_markup=cancel_kb(),
         parse_mode="HTML",
     )
+    await state.set_state(AddMovie.waiting_code)
 
 
-@router.message(AddMovieStates.waiting_code)
-async def add_movie_code(message: Message, state: FSMContext) -> None:
+@router.message(AddMovie.waiting_code)
+async def add_movie_code(message: Message, state: FSMContext):
     code = message.text.strip()
-
-    async with async_session() as session:
-        existing = await session.scalar(select(Movie).where(Movie.code == code))
-
-    if existing:
-        await message.answer(
-            f"⚠️ <b>«{code}» kodi allaqachon mavjud!</b>\n\n"
-            "🔢 Boshqa noyob kod kiriting:",
-            reply_markup=cancel_kb(),
-            parse_mode="HTML",
-        )
-        return
+    async with AsyncSessionLocal() as s:
+        res = await s.execute(select(MovieModel).where(MovieModel.code == code))
+        if res.scalar_one_or_none():
+            await message.answer(
+                f"⚠️ <b>«{code}» kodi allaqachon mavjud!</b>\n\n"
+                "Boshqa kod kiriting yoki /admin buyrug'i orqali qaytib chiqing.",
+                parse_mode="HTML",
+            )
+            return
 
     await state.update_data(code=code)
-    await state.set_state(AddMovieStates.waiting_video)
     await message.answer(
-        f"✅ <b>Kod qabul qilindi:</b> <code>{code}</code>\n\n"
-        "2️⃣ Endi <b>video faylni</b> yuboring:\n"
-        "🎥 (Video, GIF yoki hujjat shaklida bo'lishi mumkin)",
+        f"✅ Kod: <code>{code}</code>\n\n"
+        "2️⃣ Endi <b>video faylni</b> yuboring:\n\n"
+        "📤 <i>Video sifatida yuboring (hujjat sifatida emas!)</i>",
         reply_markup=cancel_kb(),
         parse_mode="HTML",
     )
+    await state.set_state(AddMovie.waiting_video)
 
 
-@router.message(AddMovieStates.waiting_video)
-async def add_movie_video(message: Message, state: FSMContext) -> None:
-    if not (message.video or message.document or message.animation):
-        await message.answer(
-            "⚠️ <b>Iltimos, video fayl yuboring!</b>\n"
-            "📝 Matn emas, aniq video kerak.",
-            reply_markup=cancel_kb(),
-            parse_mode="HTML",
-        )
-        return
-
+@router.message(AddMovie.waiting_video, F.video | F.document)
+async def add_movie_video(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     code = data["code"]
 
-    async with async_session() as session:
-        movie = Movie(
+    async with AsyncSessionLocal() as s:
+        movie = MovieModel(
             code=code,
             chat_id=message.chat.id,
             message_id=message.message_id,
+            title=code,
         )
-        session.add(movie)
-        await session.commit()
+        s.add(movie)
+        await s.commit()
 
     await state.clear()
     await message.answer(
         f"🎉 <b>Kino muvaffaqiyatli qo'shildi!</b>\n\n"
-        f"📎 Kod: <code>{code}</code>\n"
-        f"🎬 Saqlandi: chat_id={message.chat.id}, msg_id={message.message_id}\n\n"
-        "👥 Endi foydalanuvchilar bu kinoni kod orqali tomosha qilishadi!",
-        reply_markup=back_admin_kb(),
+        f"🔑 Kod: <code>{code}</code>\n"
+        f"📨 Foydalanuvchilar shu kodni yuborsalar kino yetadi!\n\n"
+        "👑 /admin — Panel",
         parse_mode="HTML",
     )
 
 
-# ───────────────────────────────────────────────────────────
-#  📊 STATISTIKA
-# ───────────────────────────────────────────────────────────
-@router.callback_query(F.data == "stats")
-async def cb_stats(callback: CallbackQuery) -> None:
-    if not await _require_admin(callback):
-        return
+# ── Statistika ──
+@router.callback_query(F.data == "admin_stats")
+async def admin_stats(call: CallbackQuery):
+    async with AsyncSessionLocal() as s:
+        if not await is_admin(s, call.from_user.id):
+            await call.answer("🚫 Ruxsat yo'q!", show_alert=True)
+            return
 
-    async with async_session() as session:
-        user_count = await session.scalar(select(func.count(User.id))) or 0
-        movie_count = await session.scalar(select(func.count(Movie.id))) or 0
-        total_views = await session.scalar(select(func.sum(Movie.views))) or 0
-        top_movies = list(
-            (
-                await session.scalars(
-                    select(Movie).order_by(Movie.views.desc()).limit(10)
-                )
-            ).all()
+        user_count = await s.scalar(select(func.count()).select_from(UserModel))
+        movie_count = await s.scalar(select(func.count()).select_from(MovieModel))
+        top_res = await s.execute(
+            select(MovieModel).order_by(MovieModel.views.desc()).limit(10)
         )
+        top_movies = top_res.scalars().all()
 
-    medals = ["🥇", "🥈", "🥉"]
     top_text = ""
-    for i, mv in enumerate(top_movies, 1):
-        icon = medals[i - 1] if i <= 3 else f"<b>{i}.</b>"
-        top_text += f"{icon} <code>{mv.code}</code> — <b>{mv.views:,}</b> 👁\n"
+    for i, m in enumerate(top_movies, 1):
+        top_text += f"  {i}. <code>{m.code}</code> — 👁 {m.views} marta\n"
 
-    await callback.message.edit_text(
-        "📊 <b>Bot Statistikasi</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"👥 Foydalanuvchilar: <b>{user_count:,}</b>\n"
-        f"🎬 Kinolar: <b>{movie_count:,}</b>\n"
-        f"👁 Jami ko'rishlar: <b>{total_views:,}</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "🏆 <b>Top-10 eng ko'p ko'rilgan:</b>\n\n"
-        f"{top_text or '❌ Hali ko\'rishlar yo\'q'}",
-        reply_markup=back_admin_kb(),
+    if not top_text:
+        top_text = "  <i>Hali kino ko'rilmagan</i>\n"
+
+    await call.message.edit_text(
+        "📊 <b>Bot Statistikasi</b>\n\n"
+        f"👥 Jami foydalanuvchilar: <b>{user_count}</b>\n"
+        f"🎬 Jami kinolar: <b>{movie_count}</b>\n\n"
+        "🏆 <b>Eng ko'p ko'rilgan 10 ta kino:</b>\n"
+        f"{top_text}",
+        reply_markup=back_kb(),
         parse_mode="HTML",
     )
 
 
-# ───────────────────────────────────────────────────────────
-#  📢 REKLAMA TARQATISH
-# ───────────────────────────────────────────────────────────
-@router.callback_query(F.data == "broadcast")
-async def cb_broadcast(callback: CallbackQuery, state: FSMContext) -> None:
-    if not await _require_admin(callback):
-        return
-    await state.set_state(BroadcastStates.choosing_type)
-    await callback.message.edit_text(
-        "📢 <b>Reklama Tarqatish</b>\n\n"
-        "📌 Qaysi turdagi reklama yubormoqchisiz?",
-        reply_markup=broadcast_type_kb(),
-        parse_mode="HTML",
-    )
+# ── Reklama ──
+@router.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_start(call: CallbackQuery, state: FSMContext):
+    async with AsyncSessionLocal() as s:
+        if not await is_admin(s, call.from_user.id):
+            await call.answer("🚫 Ruxsat yo'q!", show_alert=True)
+            return
 
-
-@router.callback_query(F.data.in_({"bc_text", "bc_photo", "bc_forward"}))
-async def cb_broadcast_type(callback: CallbackQuery, state: FSMContext) -> None:
-    type_map = {"bc_text": "text", "bc_photo": "photo", "bc_forward": "forward"}
-    hints = {
-        "text": "📝 Matn xabarini yuboring:",
-        "photo": "🖼 Rasm (caption bilan yoki yalang'och) yuboring:",
-        "forward": "📨 Forward qilmoqchi bo'lgan xabarni yuboring:",
-    }
-    bc_type = type_map[callback.data]
-    await state.update_data(bc_type=bc_type)
-    await state.set_state(BroadcastStates.waiting_content)
-    await callback.message.edit_text(
-        f"📢 <b>Reklama ({bc_type.upper()})</b>\n\n"
-        f"{hints[bc_type]}\n\n"
-        "⚠️ <i>Bu xabar BARCHA foydalanuvchilarga yuboriladi!</i>",
+    await call.message.edit_text(
+        "📣 <b>Reklama Yuborish</b>\n\n"
+        "Yubormoqchi bo'lgan xabaringizni kiriting:\n"
+        "📝 Matn, 🖼 rasm yoki 📨 Forward qilingan xabar bo'lishi mumkin.\n\n"
+        "⚠️ <i>Xabar barcha foydalanuvchilarga jo'natiladi!</i>",
         reply_markup=cancel_kb(),
         parse_mode="HTML",
     )
+    await state.set_state(Broadcast.waiting_content)
 
 
-@router.message(BroadcastStates.waiting_content)
-async def broadcast_do_send(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    bc_type = data.get("bc_type", "text")
+@router.message(Broadcast.waiting_content)
+async def do_broadcast(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
+    async with AsyncSessionLocal() as s:
+        res = await s.execute(select(UserModel))
+        users = res.scalars().all()
 
-    async with async_session() as session:
-        users = list((await session.scalars(select(User))).all())
-
-    total = len(users)
-    success = 0
-    fail = 0
-
-    status_msg = await message.answer(
-        f"⏳ <b>Reklama tarqatilmoqda...</b>\n"
-        f"👥 Jami: <b>{total:,}</b> foydalanuvchi",
-        parse_mode="HTML",
-    )
-
+    sent, failed = 0, 0
     for user in users:
         try:
-            if bc_type == "text" and message.text:
-                await message.bot.send_message(
-                    user.user_id, message.text, parse_mode="HTML"
-                )
-            elif bc_type == "photo" and message.photo:
-                await message.bot.send_photo(
-                    user.user_id,
-                    message.photo[-1].file_id,
-                    caption=message.caption,
-                )
-            elif bc_type == "forward":
-                await message.bot.forward_message(
-                    user.user_id, message.chat.id, message.message_id
-                )
-            success += 1
+            await message.copy_to(user.id)
+            sent += 1
         except (TelegramForbiddenError, TelegramBadRequest):
-            fail += 1
-        except Exception as e:
-            logging.error(f"Broadcast xatosi [{user.user_id}]: {e}")
-            fail += 1
+            failed += 1
+        await asyncio.sleep(0.05)
 
-        await asyncio.sleep(0.05)  # Telegram rate limit
-
-    await status_msg.edit_text(
-        "✅ <b>Reklama tarqatildi!</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"✉️ Muvaffaqiyatli: <b>{success:,}</b>\n"
-        f"❌ Xatolik: <b>{fail:,}</b>",
-        reply_markup=back_admin_kb(),
+    await message.answer(
+        f"📣 <b>Reklama yakunlandi!</b>\n\n"
+        f"✅ Muvaffaqiyatli: <b>{sent}</b>\n"
+        f"❌ Xatolik: <b>{failed}</b>",
         parse_mode="HTML",
+        reply_markup=back_kb(),
     )
 
 
-# ───────────────────────────────────────────────────────────
-#  📡 KANALLARNI BOSHQARISH
-# ───────────────────────────────────────────────────────────
-@router.callback_query(F.data == "manage_channels")
-async def cb_manage_channels(callback: CallbackQuery) -> None:
-    if not await _require_admin(callback):
-        return
-    channels = await get_all_channels()
-    count_text = f"📋 Hozirda <b>{len(channels)}</b> ta majburiy kanal mavjud."
-    await callback.message.edit_text(
-        f"📡 <b>Kanallarni Boshqarish</b>\n\n{count_text}\n\n"
-        "Quyidagi amallardan birini tanlang:",
-        reply_markup=channels_panel_kb(),
+# ── Kanallar boshqaruvi ──
+@router.callback_query(F.data == "admin_channels")
+async def admin_channels(call: CallbackQuery):
+    async with AsyncSessionLocal() as s:
+        if not await is_admin(s, call.from_user.id):
+            await call.answer("🚫 Ruxsat yo'q!", show_alert=True)
+            return
+        channels = await get_channels(s)
+
+    ch_text = "\n".join([f"  • {ch}" for ch in channels]) if channels else "  <i>Hali kanal yo'q</i>"
+
+    buttons = []
+    for ch in channels:
+        buttons.append([InlineKeyboardButton(
+            text=f"🗑 {ch} o'chirish",
+            callback_data=f"del_channel:{ch}"
+        )])
+    buttons.append([InlineKeyboardButton(text="➕ Kanal qo'shish", callback_data="add_channel")])
+    buttons.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin_panel")])
+
+    await call.message.edit_text(
+        "📢 <b>Majburiy Obuna Kanallar</b>\n\n"
+        f"{ch_text}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode="HTML",
-    )
-
-
-@router.callback_query(F.data == "list_channels")
-async def cb_list_channels(callback: CallbackQuery) -> None:
-    channels = await get_all_channels()
-    if not channels:
-        await callback.answer("📋 Kanallar ro'yxati hozircha bo'sh!", show_alert=True)
-        return
-
-    text = "📋 <b>Majburiy Kanallar:</b>\n\n"
-    for i, ch in enumerate(channels, 1):
-        username = f"@{ch.channel_username}" if ch.channel_username else "—"
-        text += (
-            f"<b>{i}. {ch.channel_name}</b>\n"
-            f"   🆔 <code>{ch.channel_id}</code>\n"
-            f"   🔗 {username}\n\n"
-        )
-
-    await callback.message.edit_text(
-        text, reply_markup=channels_panel_kb(), parse_mode="HTML"
     )
 
 
 @router.callback_query(F.data == "add_channel")
-async def cb_add_channel(callback: CallbackQuery, state: FSMContext) -> None:
-    if not await _require_admin(callback):
-        return
-    await state.set_state(AddChannelStates.waiting_channel)
-    await callback.message.edit_text(
-        "📡 <b>Yangi Kanal Qo'shish</b>\n\n"
-        "✅ Avval botni kanalga <b>admin</b> qiling!\n\n"
-        "Keyin kanal <b>username</b> yoki <b>ID</b>ini yuboring:\n"
-        "💡 Masalan: <code>@mychannel</code> yoki <code>-1001234567890</code>",
+async def add_channel_start(call: CallbackQuery, state: FSMContext):
+    await call.message.edit_text(
+        "📢 <b>Yangi kanal qo'shish</b>\n\n"
+        "Kanal username'ini yuboring:\n"
+        "💡 <i>Masalan: </i><code>@mychannel</code>",
         reply_markup=cancel_kb(),
         parse_mode="HTML",
     )
+    await state.set_state(AddChannel.waiting_username)
 
 
-@router.message(AddChannelStates.waiting_channel)
-async def add_channel_process(message: Message, state: FSMContext) -> None:
-    channel_input = message.text.strip()
-    try:
-        chat = await message.bot.get_chat(channel_input)
-    except Exception:
-        await message.answer(
-            "❌ <b>Kanal topilmadi!</b>\n\n"
-            "⚠️ Botni kanalga admin qilganingizni tekshiring.\n"
-            "🔄 Qaytadan urinib ko'ring:",
-            reply_markup=cancel_kb(),
-            parse_mode="HTML",
-        )
-        return
+@router.message(AddChannel.waiting_username)
+async def do_add_channel(message: Message, state: FSMContext):
+    username = message.text.strip()
+    if not username.startswith("@"):
+        username = "@" + username
 
-    async with async_session() as session:
-        existing = await session.scalar(
-            select(Channel).where(Channel.channel_id == chat.id)
-        )
-        if existing:
+    async with AsyncSessionLocal() as s:
+        res = await s.execute(select(ChannelModel).where(ChannelModel.username == username))
+        if res.scalar_one_or_none():
+            await message.answer(f"⚠️ <b>{username}</b> allaqachon ro'yxatda!", parse_mode="HTML")
+        else:
+            s.add(ChannelModel(username=username))
+            await s.commit()
             await message.answer(
-                "⚠️ <b>Bu kanal allaqachon qo'shilgan!</b>",
-                reply_markup=back_admin_kb(),
+                f"✅ <b>{username}</b> muvaffaqiyatli qo'shildi!",
                 parse_mode="HTML",
+                reply_markup=back_kb("admin_channels"),
             )
-            await state.clear()
-            return
-
-        session.add(
-            Channel(
-                channel_id=chat.id,
-                channel_username=chat.username,
-                channel_name=chat.title or "Nomsiz kanal",
-            )
-        )
-        await session.commit()
-
     await state.clear()
-    await message.answer(
-        f"✅ <b>Kanal muvaffaqiyatli qo'shildi!</b>\n\n"
-        f"📢 Nomi: <b>{chat.title}</b>\n"
-        f"🆔 ID: <code>{chat.id}</code>",
-        reply_markup=back_admin_kb(),
+
+
+@router.callback_query(F.data.startswith("del_channel:"))
+async def del_channel(call: CallbackQuery):
+    ch = call.data.split(":", 1)[1]
+    async with AsyncSessionLocal() as s:
+        res = await s.execute(select(ChannelModel).where(ChannelModel.username == ch))
+        obj = res.scalar_one_or_none()
+        if obj:
+            await s.delete(obj)
+            await s.commit()
+    await call.answer(f"🗑 {ch} o'chirildi!", show_alert=True)
+    # Yangilangan ro'yxatni ko'rsatish
+    await admin_channels(call)
+
+
+# ── Adminlar boshqaruvi ──
+@router.callback_query(F.data == "admin_admins")
+async def admin_admins(call: CallbackQuery):
+    async with AsyncSessionLocal() as s:
+        if not await is_admin(s, call.from_user.id):
+            await call.answer("🚫 Ruxsat yo'q!", show_alert=True)
+            return
+        res = await s.execute(select(AdminModel))
+        admins = res.scalars().all()
+
+    adm_text = "\n".join([f"  • <code>{a.id}</code>" for a in admins]) or "  <i>Hali qo'shimcha admin yo'q</i>"
+    super_text = "\n".join([f"  • <code>{sid}</code>" for sid in SUPER_ADMINS])
+
+    buttons = []
+    for adm in admins:
+        buttons.append([InlineKeyboardButton(
+            text=f"🗑 {adm.id} o'chirish",
+            callback_data=f"del_admin:{adm.id}"
+        )])
+    buttons.append([InlineKeyboardButton(text="➕ Admin qo'shish", callback_data="add_admin")])
+    buttons.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin_panel")])
+
+    await call.message.edit_text(
+        "👑 <b>Adminlar Boshqaruvi</b>\n\n"
+        f"⭐ Super adminlar:\n{super_text}\n\n"
+        f"👮 Qo'shimcha adminlar:\n{adm_text}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode="HTML",
     )
 
 
-@router.callback_query(F.data == "remove_channel")
-async def cb_remove_channel(callback: CallbackQuery, state: FSMContext) -> None:
-    if not await _require_admin(callback):
-        return
-    channels = await get_all_channels()
-    if not channels:
-        await callback.answer("❌ O'chirish uchun kanal yo'q!", show_alert=True)
-        return
-
-    text = "🗑 <b>Kanal O'chirish</b>\n\nO'chirmoqchi bo'lgan kanalning ID sini yuboring:\n\n"
-    for ch in channels:
-        text += f"📢 <b>{ch.channel_name}</b> → <code>{ch.channel_id}</code>\n"
-
-    await state.set_state(RemoveChannelStates.waiting_id)
-    await callback.message.edit_text(text, reply_markup=cancel_kb(), parse_mode="HTML")
-
-
-@router.message(RemoveChannelStates.waiting_id)
-async def remove_channel_process(message: Message, state: FSMContext) -> None:
-    try:
-        channel_id = int(message.text.strip())
-    except ValueError:
-        await message.answer(
-            "⚠️ <b>Iltimos, to'g'ri kanal ID kiriting!</b>",
-            reply_markup=cancel_kb(),
-            parse_mode="HTML",
-        )
-        return
-
-    async with async_session() as session:
-        channel = await session.scalar(
-            select(Channel).where(Channel.channel_id == channel_id)
-        )
-        if not channel:
-            await message.answer(
-                f"❌ <b>{channel_id} ID li kanal topilmadi!</b>",
-                reply_markup=cancel_kb(),
-                parse_mode="HTML",
-            )
-            return
-
-        ch_name = channel.channel_name
-        await session.delete(channel)
-        await session.commit()
-
-    await state.clear()
-    await message.answer(
-        f"✅ <b>Kanal o'chirildi!</b>\n\n"
-        f"📢 {ch_name} (<code>{channel_id}</code>)",
-        reply_markup=back_admin_kb(),
-        parse_mode="HTML",
-    )
-
-
-# ───────────────────────────────────────────────────────────
-#  👑 ADMIN QO'SHISH (faqat SUPER_ADMIN)
-# ───────────────────────────────────────────────────────────
 @router.callback_query(F.data == "add_admin")
-async def cb_add_admin(callback: CallbackQuery, state: FSMContext) -> None:
-    if callback.from_user.id != SUPER_ADMIN_ID:
-        await callback.answer(
-            "⛔ Faqat Super Admin yangi admin qo'sha oladi!", show_alert=True
-        )
+async def add_admin_start(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id not in SUPER_ADMINS:
+        await call.answer("🚫 Faqat super admin qo'sha oladi!", show_alert=True)
         return
-    await state.set_state(AddAdminStates.waiting_user_id)
-    await callback.message.edit_text(
+    await call.message.edit_text(
         "👑 <b>Yangi Admin Qo'shish</b>\n\n"
-        "Admin qilmoqchi bo'lgan foydalanuvchining\n"
-        "<b>Telegram ID</b>ini yuboring:\n\n"
-        "💡 ID ni bilish uchun @userinfobot dan foydalaning",
+        "Admin Telegram ID sini yuboring:\n"
+        "💡 <i>Masalan: </i><code>123456789</code>",
         reply_markup=cancel_kb(),
         parse_mode="HTML",
     )
+    await state.set_state(AddAdmin.waiting_id)
 
 
-@router.message(AddAdminStates.waiting_user_id)
-async def add_admin_process(message: Message, state: FSMContext) -> None:
+@router.message(AddAdmin.waiting_id)
+async def do_add_admin(message: Message, state: FSMContext):
     try:
         new_id = int(message.text.strip())
     except ValueError:
-        await message.answer(
-            "⚠️ <b>Iltimos, to'g'ri Telegram ID kiriting!</b>",
-            reply_markup=cancel_kb(),
-            parse_mode="HTML",
-        )
+        await message.answer("❌ <b>Noto'g'ri ID!</b> Faqat raqam kiriting.", parse_mode="HTML")
         return
 
-    async with async_session() as session:
-        existing = await session.scalar(
-            select(Admin).where(Admin.user_id == new_id)
-        )
+    async with AsyncSessionLocal() as s:
+        existing = await s.get(AdminModel, new_id)
         if existing:
+            await message.answer(f"⚠️ <code>{new_id}</code> allaqachon admin!", parse_mode="HTML")
+        else:
+            s.add(AdminModel(id=new_id))
+            await s.commit()
             await message.answer(
-                "⚠️ <b>Bu foydalanuvchi allaqachon admin!</b>",
-                reply_markup=back_admin_kb(),
+                f"✅ <code>{new_id}</code> admin sifatida qo'shildi!",
+                parse_mode="HTML",
+                reply_markup=back_kb("admin_admins"),
+            )
+    await state.clear()
+
+
+@router.callback_query(F.data.startswith("del_admin:"))
+async def del_admin(call: CallbackQuery):
+    if call.from_user.id not in SUPER_ADMINS:
+        await call.answer("🚫 Faqat super admin o'chira oladi!", show_alert=True)
+        return
+    uid = int(call.data.split(":", 1)[1])
+    async with AsyncSessionLocal() as s:
+        obj = await s.get(AdminModel, uid)
+        if obj:
+            await s.delete(obj)
+            await s.commit()
+    await call.answer(f"🗑 {uid} adminlikdan olib tashlandi!", show_alert=True)
+    await admin_admins(call)
+
+
+# ── Bekor qilish ──
+@router.callback_query(F.data == "cancel_action")
+async def cancel_action(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text(
+        "❌ <b>Amal bekor qilindi.</b>",
+        reply_markup=back_kb(),
+        parse_mode="HTML",
+    )
+
+
+# ── Kino kodi ──
+@router.message(F.text & ~F.text.startswith("/"))
+async def handle_movie_code(message: Message, bot: Bot):
+    code = message.text.strip()
+
+    async with AsyncSessionLocal() as s:
+        await register_user(s, message)
+        channels = await get_channels(s)
+        not_sub = await check_subscription(bot, message.from_user.id, channels)
+
+        if not_sub:
+            await message.answer(
+                "🔐 <b>Avval kanallarga obuna bo'ling!</b>",
+                reply_markup=sub_keyboard(not_sub),
                 parse_mode="HTML",
             )
-            await state.clear()
             return
 
-        session.add(Admin(user_id=new_id))
-        await session.commit()
+        res = await s.execute(select(MovieModel).where(MovieModel.code == code))
+        movie = res.scalar_one_or_none()
 
-    await state.clear()
-    await message.answer(
-        f"✅ <b>Yangi admin qo'shildi!</b>\n"
-        f"👑 ID: <code>{new_id}</code>",
-        reply_markup=back_admin_kb(),
-        parse_mode="HTML",
-    )
+        if not movie:
+            await message.answer(
+                f"🔍 <b>«{code}» kodli kino topilmadi!</b>\n\n"
+                "💡 <i>Kodni to'g'ri kiritganingizni tekshiring.</i>",
+                parse_mode="HTML",
+            )
+            return
+
+        # Ko'rishlar sonini oshirish
+        await s.execute(
+            sa_update(MovieModel).where(MovieModel.code == code).values(views=MovieModel.views + 1)
+        )
+        await s.commit()
+
+    # Kinoni caption va forward yozuvisiz nusxalash
+    try:
+        await bot.copy_message(
+            chat_id=message.chat.id,
+            from_chat_id=movie.chat_id,
+            message_id=movie.message_id,
+            caption=None,
+        )
+    except TelegramBadRequest as e:
+        log.error(f"copy_message xatosi: {e}")
+        await message.answer(
+            "⚠️ <b>Kino yuborishda xatolik yuz berdi!</b>\n"
+            "Iltimos, keyinroq urinib ko'ring.",
+            parse_mode="HTML",
+        )
 
 
-# ───────────────────────────────────────────────────────────
-#  ❌ BEKOR QILISH
-# ───────────────────────────────────────────────────────────
-@router.callback_query(F.data == "cancel")
-async def cb_cancel(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    admin = await check_is_admin(callback.from_user.id)
-    await callback.message.edit_text(
-        "❌ <b>Amal bekor qilindi.</b>",
-        reply_markup=admin_panel_kb() if admin else main_menu_kb(),
-        parse_mode="HTML",
-    )
-
-
-# ═══════════════════════════════════════════════════════════
-#  🚀  MAIN — Botni ishga tushirish
-# ═══════════════════════════════════════════════════════════
-async def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-
-    logging.info("🗄  Baza yaratilmoqda...")
+# ─────────────────────────────────────────────
+# 🚀  ASOSIY FUNKSIYA
+# ─────────────────────────────────────────────
+async def main():
     await init_db()
-    logging.info("✅ Baza tayyor!")
+    log.info("✅ Baza tayyor!")
 
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
-
-    # Middleware ni Message va CallbackQuery uchun ro'yxatdan o'tkazish
-    dp.message.outer_middleware(SubscriptionMiddleware())
-    dp.callback_query.outer_middleware(SubscriptionMiddleware())
-
     dp.include_router(router)
 
-    logging.info("🎬 Kino Bot ishga tushdi!")
-    await dp.start_polling(bot, skip_updates=True)
+    log.info("🚀 Bot ishga tushmoqda...")
+    await dp.start_polling(bot, allowed_updates=Update.all_types())
 
 
 if __name__ == "__main__":
