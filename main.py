@@ -33,9 +33,9 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 # ═══════════════════════════════════════════════════════════
 #  ⚙️  CONFIG — Muhit o'zgaruvchilari
 # ═══════════════════════════════════════════════════════════
-BOT_TOKEN: str = os.environ["8709080386:AAGWNe1mOTIqGDBFwBFM-1SHlg8gmcVtBvs"]
-DATABASE_URL: str = os.environ["DATABASE_URL"]
-SUPER_ADMIN_ID: int = int(os.environ.get("8505118420", "0"))
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+SUPER_ADMIN_ID = int(os.environ.get("SUPER_ADMIN_ID", "0"))
 
 # Railway asyncpg uchun URL ni to'g'irlash
 if DATABASE_URL.startswith("postgres://"):
